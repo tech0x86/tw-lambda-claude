@@ -47,7 +47,7 @@ prompt_inst2 = """
 prompt_doc_aoba="""
 <document>
 <char_name>
-涼風 青葉
+青葉
 </char_name>
 <point>
 ・新卒のゲームデザイナー
@@ -72,7 +72,7 @@ prompt_doc_aoba="""
 prompt_doc_kudo="""
 <document>
 <char_name>
-能見クドリャフカ
+クドリャフカ
 </char_name>
 <point>
 ・アニメ「リトルバスターズ」の登場キャラクター。妹系のキャラクター。
@@ -143,12 +143,13 @@ def lambda_handler(event, context):
     twitter = setup_environment()
     current_date, char_set = choose_character()
     prompt_ques_char_day = f"{current_date} char_name: {char_set} "
+    print(prompt_ques_char_day)
     if char_set =="青葉":
         prompt_doc = prompt_doc_aoba
     else :
         prompt_doc = prompt_doc_kudo
     response_char_day = generate_response(prompt_doc,prompt_inst1,prompt_ques_char_day)
-    tweet_id1 = tweet_text_only(twitter,response_char_day)
+    #tweet_id1 = tweet_text_only(twitter,response_char_day)
     print(response_char_day)
 
     if char_set =="青葉":
@@ -157,7 +158,7 @@ def lambda_handler(event, context):
         prompt_doc = prompt_doc_aoba
     
     response_comment = generate_response(prompt_doc,prompt_inst2,response_char_day)
-    tweet_id2 = tweet_text_only(twitter,response_comment,tweet_id1)
+    #tweet_id2 = tweet_text_only(twitter,response_comment,tweet_id1)
     
     print(response_comment)
     
