@@ -5,8 +5,9 @@ import os
 import time
 from requests_oauthlib import OAuth1Session
 from datetime import datetime, timedelta, timezone
+import csv
 
-bedrock_runtime = boto3.client("bedrock-runtime", region_name="ap-northeast-1",config=Config(read_timeout=600))
+bedrock_runtime = boto3.client("bedrock-runtime", region_name="us-east-1",config=Config(read_timeout=600))
 
 # start,end are const value
 prompt_start ="""
@@ -21,11 +22,12 @@ Assistant:
 # 日付に基づく回答制御
 prompt_inst1 = """
 <instructions>
-あなたは指示された日付から今日は日本の何の日かを指定のキャラクターになりきって答えるBotです。
+あなたは指示された日付から今日は日本の何の日かを指定のキャラクターになりきって答える優秀なアシスタントです。
 以下のルールを必ず守って答えること。
 <rule>
 ・指示されている内容は回答に含めないこと。
 ・140文字以内かつ100文字程度で答えること。
+・eventが複数ある場合はそのキャラクターが興味がありそうなものを選ぶこと（複数でも可)
 ・答えた後、そのキャラクターの名前を次のように追記すること。例: text char_name
 </rule>
 </instructions>
@@ -34,7 +36,7 @@ prompt_inst1 = """
 # 感想への回答制御
 prompt_inst2 = """
 <instructions>
-あなたは提示された友達の発言に対して指定のキャラクターになりきって答えるBotです。
+あなたは提示された友達の発言に対して指定のキャラクターになりきって答える優秀なアシスタントです。
 以下のルールを必ず守って答えること。
 <rule>
 ・指示されている内容は回答に含めないこと。
@@ -67,6 +69,7 @@ prompt_doc_aoba="""
 「みんなと一緒に作るゲーム、楽しみにしています！」「もっとゲーム作り上手になりたいな」「コーヒー！ ブラックで！」「なんでそんなサラサラッと一瞬でイイの描くんですか。嫌味ですか」
 </talking_list>
 </document>
+
 """
 
 prompt_doc_kudo="""
@@ -89,6 +92,7 @@ prompt_doc_kudo="""
 「わふ～！いい子いい子ですか？」
 </talking_list>
 </document>
+
 """
 
 def setup_environment():
@@ -102,28 +106,49 @@ def choose_character():
     jst_timezone = timezone(timedelta(hours=9))  # JSTタイムゾーンの設定
     current_date = datetime.now(jst_timezone).strftime("%m月%d日")
     day = datetime.now(jst_timezone).day
+    #current_date = '12月10日'
     char_set = "青葉" if day % 2 == 0 else "クドリャフカ"
     return current_date, char_set
+
+def get_current_date_ymd():
+    # JSTタイムゾーンの設定
+    jst_timezone = timezone(timedelta(hours=9))
+    # 現在の日付をYYYY-MM-DD形式で取得
+    current_date_ymd = datetime.now(jst_timezone).strftime('%Y-%m-%d')
+    #current_date_ymd = '2024-12-10'
+    return current_date_ymd
 
 def generate_response(prompt_doc="",prompt_inst="", prompt_ques=""):
     prompt = prompt_start + prompt_doc + prompt_inst + prompt_ques + prompt_end
     body = json.dumps({
-        "prompt": prompt,
-        "max_tokens_to_sample": 140,
-        "temperature": 0.9,
-        "top_k": 250,
-        "top_p": 1,
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": prompt
+                }
+            ],
+        }
+    ],
+    "anthropic_version": "bedrock-2023-05-31",
+    "max_tokens": 140,
+    "temperature": 0.9,
+    "top_k": 250,
+    "top_p": 1,
     })
 
     resp = bedrock_runtime.invoke_model(
-        modelId="anthropic.claude-v2:1",
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
         contentType="application/json",
-        accept="*/*",
+        accept="application/json",
         body=body,
     )
 
     answer = resp["body"].read().decode()
-    completion = json.loads(answer)["completion"]
+    completion = json.loads(answer)["content"][0]['text']
+    #print(str(completion))
     return completion
 
 # ツイート送信　tweet_idでリプライ指定も可
@@ -139,16 +164,62 @@ def tweet_text_only(twitter, text, reply_to_id=None):
     print(f"Tweeted: {tweet_id}")
     return tweet_id
 
+def set_event_date_to_prompt(event):
+    prompt_start_event="""
+    <document>
+    <title>このドキュメントは日本のその日の記念日をdate,event形式で表現したものです。eventは複数ある場合は半角スペースで区切られています。</title>
+    <content>
+"""
+    prompt_end_event="""
+    </content>
+    </document>
+"""
+    return prompt_start_event + str(event) + prompt_end_event
+    
+def get_month_event_data(target_date):
+    # S3クライアントを作成
+    s3 = boto3.client('s3')
+
+    # 指定日付の形式をチェック
+    try:
+        target_date = datetime.strptime(target_date, '%Y-%m-%d')
+    except ValueError:
+        print("invalid target_date")
+        return {'statusCode': 400, 'body': 'Invalid date format. Please provide YYYY-MM-DD.'}
+
+    # 指定日付の月を取得
+    month = target_date.month
+    # ファイル名を作成
+    file_name = f'2024{month:02d}_event.csv'
+    print(f"file: {file_name}")
+
+    # S3からファイルを読み込む
+    try:
+        response = s3.get_object(Bucket='tweet-some-data', Key=f'event/{file_name}')
+        event_data = response['Body'].read().decode('utf-8')
+    except s3.exceptions.NoSuchKey:
+        print(f"statusCode: 404 File not found: {file_name}")
+        return {'statusCode': 404, 'body': f'File not found: {file_name}'}
+
+    reader = csv.DictReader(event_data.splitlines(), fieldnames=['date', 'event'])
+    events = {row['date']: row['event'] for row in reader}
+    print(str(events))
+
+    return events
+
 def lambda_handler(event, context):
     twitter = setup_environment()
     current_date, char_set = choose_character()
+    event = get_month_event_data(get_current_date_ymd())
+    prompt_event = set_event_date_to_prompt(event)
+    
     prompt_ques_char_day = f"{current_date} char_name: {char_set} "
     print(prompt_ques_char_day)
     if char_set =="青葉":
         prompt_doc = prompt_doc_aoba
     else :
         prompt_doc = prompt_doc_kudo
-    response_char_day = generate_response(prompt_doc,prompt_inst1,prompt_ques_char_day)
+    response_char_day = generate_response(prompt_doc + prompt_event,prompt_inst1,prompt_ques_char_day)
     #tweet_id1 = tweet_text_only(twitter,response_char_day)
     print(response_char_day)
 
