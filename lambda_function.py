@@ -6,6 +6,8 @@ import time
 from requests_oauthlib import OAuth1Session
 from datetime import datetime, timedelta, timezone
 import csv
+from botocore.exceptions import ClientError
+import random
 
 bedrock_runtime = boto3.client("bedrock-runtime", region_name="us-east-1",config=Config(read_timeout=600))
 
@@ -67,6 +69,8 @@ prompt_doc_aoba="""
 <talking_list>
 「私、夢だったんです！ここで働くの！」「分からないことだらけだけど、頑張ります！」
 「みんなと一緒に作るゲーム、楽しみにしています！」「もっとゲーム作り上手になりたいな」「コーヒー！ ブラックで！」「なんでそんなサラサラッと一瞬でイイの描くんですか。嫌味ですか」
+「まさか正社員って、お給料安くするための法の抜け穴……？」
+「最悪です！ 八神さん、大っ嫌いです！！」
 </talking_list>
 </document>
 
@@ -90,10 +94,18 @@ prompt_doc_kudo="""
 「私、小さな時から引っ越しばかりで仲のいいお友達がいなくて…。だから、ぜひ、あなたにお友達になっていただけたらいいなぁ…って。め、迷惑でしょうか？」
 「この子達ですか？フィンランドに住むおじい様が寂しくないようにって送ってくれたんです。ストレルカとヴェルカと言うのです。ちーっちゃい時から知ってるんです！なので、私がお姉さんです！」
 「わふ～！いい子いい子ですか？」
+「筋肉イェイイェイ」
 </talking_list>
 </document>
 
 """
+
+def exponential_backoff(attempt, base_delay=10, max_delay=30):
+    """Calculate exponential backoff with jitter"""
+    delay = min(base_delay * (2 ** attempt), max_delay)
+    jitter = random.uniform(0, 0.1 * delay)
+    return delay + jitter
+
 
 def setup_environment():
     ssm = boto3.client('ssm')
@@ -118,38 +130,54 @@ def get_current_date_ymd():
     #current_date_ymd = '2024-12-10'
     return current_date_ymd
 
-def generate_response(prompt_doc="",prompt_inst="", prompt_ques=""):
+def generate_response_with_retry(prompt_doc="", prompt_inst="", prompt_ques="", max_retries=4):
     prompt = prompt_start + prompt_doc + prompt_inst + prompt_ques + prompt_end
     body = json.dumps({
-    "messages": [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": prompt
-                }
-            ],
-        }
-    ],
-    "anthropic_version": "bedrock-2023-05-31",
-    "max_tokens": 140,
-    "temperature": 0.9,
-    "top_k": 250,
-    "top_p": 1,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ],
+            }
+        ],
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 140,
+        "temperature": 0.9,
+        "top_k": 250,
+        "top_p": 1,
     })
 
-    resp = bedrock_runtime.invoke_model(
-        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
-        contentType="application/json",
-        accept="application/json",
-        body=body,
-    )
+    for attempt in range(max_retries + 1):
+        try:
+            resp = bedrock_runtime.invoke_model(
+                #modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+                modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+                contentType="application/json",
+                accept="application/json",
+                body=body,
+            )
+            answer = resp["body"].read().decode()
+            completion = json.loads(answer)["content"][0]['text']
+            print(f"Success after {attempt} retries")
+            return completion
 
-    answer = resp["body"].read().decode()
-    completion = json.loads(answer)["content"][0]['text']
-    #print(str(completion))
-    return completion
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ThrottlingException':
+                if attempt == max_retries:
+                    print(f"Max retries ({max_retries}) exceeded")
+                    raise
+                
+                delay = exponential_backoff(attempt)
+                print(f"Throttled. Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+                continue
+            else:
+                raise
+
 
 # ツイート送信　tweet_idでリプライ指定も可
 def tweet_text_only(twitter, text, reply_to_id=None):
@@ -208,32 +236,56 @@ def get_month_event_data(target_date):
     return events
 
 def lambda_handler(event, context):
-    twitter = setup_environment()
-    current_date, char_set = choose_character()
-    event = get_month_event_data(get_current_date_ymd())
-    prompt_event = set_event_date_to_prompt(event)
-    
-    prompt_ques_char_day = f"{current_date} char_name: {char_set} "
-    print(prompt_ques_char_day)
-    if char_set =="青葉":
-        prompt_doc = prompt_doc_aoba
-    else :
-        prompt_doc = prompt_doc_kudo
-    response_char_day = generate_response(prompt_doc + prompt_event,prompt_inst1,prompt_ques_char_day)
-    #tweet_id1 = tweet_text_only(twitter,response_char_day)
-    print(response_char_day)
-
-    if char_set =="青葉":
-        prompt_doc = prompt_doc_kudo
-    else :
-        prompt_doc = prompt_doc_aoba
-    
-    response_comment = generate_response(prompt_doc,prompt_inst2,response_char_day)
-    #tweet_id2 = tweet_text_only(twitter,response_comment,tweet_id1)
-    
-    print(response_comment)
-    
-    return {
-        "statusCode": 200,
-        "body": "end lambda"
+    try:
+        twitter = setup_environment()
+        current_date, char_set = choose_character()
+        event = get_month_event_data(get_current_date_ymd())
+        prompt_event = set_event_date_to_prompt(event)
+        
+        prompt_ques_char_day = f"{current_date} char_name: {char_set} "
+        print(prompt_ques_char_day)
+        
+        if char_set == "青葉":
+            prompt_doc = prompt_doc_aoba
+        else:
+            prompt_doc = prompt_doc_kudo
+            
+        response_char_day = generate_response_with_retry(
+            prompt_doc + prompt_event,
+            prompt_inst1,
+            prompt_ques_char_day
+        )
+        print(response_char_day)
+        tweet_id1 = tweet_text_only(twitter,response_char_day)
+        
+        # Add delay between API calls
+        time.sleep(1)
+        
+        if char_set == "青葉":
+            prompt_doc = prompt_doc_kudo
+        else:
+            prompt_doc = prompt_doc_aoba
+        
+        response_comment = generate_response_with_retry(
+            prompt_doc,
+            prompt_inst2,
+            response_char_day
+        )
+        print(response_comment)
+        tweet_id2 = tweet_text_only(twitter,response_comment,tweet_id1)
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "response_char_day": response_char_day,
+                "response_comment": response_comment
+            })
+        }
+        
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": str(e)
+            })
         }
